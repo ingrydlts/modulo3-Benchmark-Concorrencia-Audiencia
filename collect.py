@@ -11,21 +11,49 @@ Fluxo:
 
 import os
 import re
+import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from notion_client import Client as NotionClient
+from notion_client.errors import APIResponseError
 from googleapiclient.discovery import build
 
 load_dotenv()
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-NOTION_TOKEN             = os.environ["NOTION_TOKEN"]
-YOUTUBE_API_KEY          = os.environ["YOUTUBE_API_KEY"]
-NOTION_DB_ID             = os.environ["NOTION_DB_ID"]
-NOTION_INTELIGENCIA_PAGE_ID = os.environ["NOTION_INTELIGENCIA_PAGE_ID"]
+NOTION_TOKEN             = os.environ.get("NOTION_TOKEN")
+YOUTUBE_API_KEY          = os.environ.get("YOUTUBE_API_KEY")
+NOTION_DB_ID             = os.environ.get("NOTION_DB_ID")
+NOTION_INTELIGENCIA_PAGE_ID = os.environ.get("NOTION_INTELIGENCIA_PAGE_ID")
+
+if not all([NOTION_TOKEN, YOUTUBE_API_KEY, NOTION_DB_ID, NOTION_INTELIGENCIA_PAGE_ID]):
+    raise SystemExit("❌ Variável de ambiente ausente. Verifique: NOTION_TOKEN, YOUTUBE_API_KEY, NOTION_DB_ID, NOTION_INTELIGENCIA_PAGE_ID")
 
 notion  = NotionClient(auth=NOTION_TOKEN)
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+
+
+# ── Validação do alvo Notion ──────────────────────────────────────────────────
+
+def detectar_tipo_alvo(target_id: str) -> str:
+    """Detecta se o ID é uma page ou database no Notion."""
+    try:
+        notion.pages.retrieve(target_id)
+        return "page"
+    except APIResponseError:
+        pass
+    try:
+        notion.databases.retrieve(target_id)
+        return "database"
+    except APIResponseError:
+        return None
+
+TARGET_TYPE = detectar_tipo_alvo(NOTION_INTELIGENCIA_PAGE_ID)
+if not TARGET_TYPE:
+    raise SystemExit(
+        f"❌ Não foi possível acessar NOTION_INTELIGENCIA_PAGE_ID ({NOTION_INTELIGENCIA_PAGE_ID}).\n"
+        "Verifique se a página existe e foi compartilhada com a integração Notion."
+    )
 
 MES_ATUAL = datetime.now(timezone.utc).strftime("%B %Y")
 
@@ -156,17 +184,32 @@ def montar_blocos_coleta(dados: dict, url_origem: str) -> list:
     return blocos
 
 
-def salvar_coleta_no_notion(dados: dict, url_origem: str):
-    """Cria página de coleta na pasta Inteligência do Notion."""
+def salvar_coleta_no_notion(dados: dict, url_origem: str, max_retries: int = 3):
+    """Cria página de coleta na pasta Inteligência do Notion com retry."""
     titulo = f"COLETA YT — {dados['nome']} — {MES_ATUAL}"
-    notion.pages.create(
-        parent={"page_id": NOTION_INTELIGENCIA_PAGE_ID},
-        properties={
-            "title": {"title": [{"text": {"content": titulo}}]}
-        },
-        children=montar_blocos_coleta(dados, url_origem)
+
+    # Detecta automaticamente se deve usar page_id ou database_id
+    parent = (
+        {"page_id": NOTION_INTELIGENCIA_PAGE_ID}
+        if TARGET_TYPE == "page"
+        else {"database_id": NOTION_INTELIGENCIA_PAGE_ID}
     )
-    print(f"  ✓ Salvo: {titulo}")
+
+    for tentativa in range(1, max_retries + 1):
+        try:
+            notion.pages.create(
+                parent=parent,
+                properties={"title": {"title": [{"text": {"content": titulo}}]}},
+                children=montar_blocos_coleta(dados, url_origem)
+            )
+            print(f"  ✓ Salvo: {titulo}")
+            return
+        except APIResponseError as e:
+            print(f"  ⚠ Erro Notion (tentativa {tentativa}/{max_retries}): {e}")
+            if tentativa == max_retries:
+                print(f"  ✗ Falha ao salvar {titulo}. Continuando para o próximo.")
+                return
+            time.sleep(2 ** tentativa)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
