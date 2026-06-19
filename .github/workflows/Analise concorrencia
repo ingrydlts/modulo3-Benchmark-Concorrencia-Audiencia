@@ -1,0 +1,32 @@
+name: Análise de Concorrência
+
+on:
+  schedule:
+    # Primeira segunda-feira do mês às 09h UTC
+    # Cron roda em qualquer segunda entre os dias 1 e 7
+    - cron: '0 9 1-7 * 1'
+  workflow_dispatch: # Permite rodar manualmente pelo GitHub
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar análise de concorrência
+        run: python analyze_concorrencia.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+          NOTION_INTELIGENCIA_PAGE_ID: ${{ secrets.NOTION_INTELIGENCIA_PAGE_ID }}
