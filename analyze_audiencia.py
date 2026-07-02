@@ -9,18 +9,24 @@ Fluxo:
 2. Organiza por plataforma (YouTube / Instagram)
 3. Envia para Claude, que devolve um JSON estruturado de análise de audiência
 4. Salva a análise em duas frentes:
-   a) Notion — subpágina legível em "🧠 Inteligência de Audiência"
+   a) Notion — uma LINHA na base "📊 Análises de Audiência (Semanal)"
+      (não mais uma subpágina solta: reprocessar a mesma semana atualiza
+      a linha existente em vez de duplicar, usando "ID Semana" como chave)
    b) insights.json — bloco estruturado em "bilans_audiencia", para o
       dashboard (index.html) exibir na aba Detalhes → Bilan Qualitativo
       de Audiência
 5. Marca as entradas usadas como PROCESSADO
 
 Variáveis de ambiente esperadas:
-  NOTION_TOKEN, ANTHROPIC_API_KEY, NOTION_DB_IG, NOTION_INTELIGENCIA_PAGE_ID
+  NOTION_TOKEN, ANTHROPIC_API_KEY, NOTION_DB_IG, NOTION_ANALISES_DB_ID
   INSIGHTS_JSON_PATH (opcional — caminho do insights.json no repo, default "insights.json")
 
-  Nota: o database do Instagram é lido da secret NOTION_DB_IG (não NOTION_DB_ID,
-  que já estava em uso por outro módulo/database no mesmo repositório).
+  Notas de nomenclatura das secrets:
+  - NOTION_DB_IG: database "🗨️ CONVERSAS AUDIÊNCIA (Instagram)" — de onde vêm as
+    entradas cruas (DMs/comentários/stories). Não se chama NOTION_DB_ID porque
+    esse nome já estava em uso por outro módulo/database no mesmo repositório.
+  - NOTION_ANALISES_DB_ID: database "📊 Análises de Audiência (Semanal)" — para
+    onde vai o bilan estruturado desta análise (uma linha por semana).
 """
 
 import os
@@ -35,11 +41,11 @@ import anthropic
 load_dotenv()
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-NOTION_TOKEN                = os.environ["NOTION_TOKEN"]
-ANTHROPIC_API_KEY           = os.environ["ANTHROPIC_API_KEY"]
-NOTION_DB_ID                = os.environ["NOTION_DB_IG"]
-NOTION_INTELIGENCIA_PAGE_ID = os.environ["NOTION_INTELIGENCIA_PAGE_ID"]
-INSIGHTS_JSON_PATH          = os.environ.get("INSIGHTS_JSON_PATH", "insights.json")
+NOTION_TOKEN       = os.environ["NOTION_TOKEN"]
+ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+NOTION_DB_ID       = os.environ["NOTION_DB_IG"]           # Conversas Audiência (Instagram)
+NOTION_ANALISES_DB_ID = os.environ["NOTION_ANALISES_DB_ID"]  # Análises de Audiência (Semanal)
+INSIGHTS_JSON_PATH = os.environ.get("INSIGHTS_JSON_PATH", "insights.json")
 
 notion = NotionClient(auth=NOTION_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -48,33 +54,39 @@ AGORA        = datetime.now(timezone.utc)
 SEMANA_ID    = AGORA.strftime("%G-W%V")       # ex: 2026-W27 (ISO week, estável mesmo virando o mês)
 SEMANA_LABEL = AGORA.strftime("%d/%m/%Y")
 
+_data_source_cache = {}
+
 
 # ── Busca de dados ────────────────────────────────────────────────────────────
 
-def resolver_data_source_id() -> str:
+def resolver_data_source_id(database_id: str) -> str:
     """
-    Resolve o data_source_id atual do database (API Notion 2025-09-03).
+    Resolve o data_source_id atual de um database (API Notion 2025-09-03+).
 
     Desde essa versão da API, bancos de dados passaram a ter uma camada
-    intermediária de "data sources" — e versões recentes do notion-client
-    removeram `databases.query()` em favor de `data_sources.query()`.
-    Em vez de fixar o data_source_id numa secret separada (que quebraria se
-    o database for reestruturado), resolvemos dinamicamente a partir do
-    NOTION_DB_ID a cada execução.
+    intermediária de "data sources", e criar/consultar páginas dentro de um
+    database passa a exigir o data_source_id (em vez do database_id direto).
+    Resolvemos dinamicamente a cada execução em vez de fixar numa secret
+    separada, para não quebrar se o database for reestruturado.
     """
-    db = notion.databases.retrieve(database_id=NOTION_DB_ID)
+    if database_id in _data_source_cache:
+        return _data_source_cache[database_id]
+
+    db = notion.databases.retrieve(database_id=database_id)
     data_sources = db.get("data_sources", [])
     if not data_sources:
         raise RuntimeError(
-            "O database (NOTION_DB_IG) não retornou nenhum data_source. "
+            f"O database {database_id} não retornou nenhum data_source. "
             "Confirme se o ID é o de um database (não de uma página comum)."
         )
-    return data_sources[0]["id"]
+    data_source_id = data_sources[0]["id"]
+    _data_source_cache[database_id] = data_source_id
+    return data_source_id
 
 
 def buscar_entradas_audiencia() -> list:
     """Busca todas as entradas AUDIÊNCIA + NOVO no banco Notion."""
-    data_source_id = resolver_data_source_id()
+    data_source_id = resolver_data_source_id(NOTION_DB_ID)
     resp = notion.data_sources.query(
         data_source_id=data_source_id,
         filter={
@@ -196,83 +208,115 @@ Onde:
         return {"erro_parse": True, "texto_bruto": texto}
 
 
-# ── Salvar no Notion (subpágina legível) ─────────────────────────────────────
-
-def _bullets(titulo: str, itens: list) -> list:
-    blocos = [{
-        "object": "block", "type": "heading_2",
-        "heading_2": {"rich_text": [{"text": {"content": titulo}}]}
-    }]
-    if not itens:
-        blocos.append({
-            "object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [{"text": {"content": "— nenhum registro nesta rodada —"}}]}
-        })
-        return blocos
-    for item in itens:
-        blocos.append({
-            "object": "block", "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": [{"text": {"content": str(item)}}]}
-        })
-    return blocos
-
-
-def bilan_para_blocos(bilan: dict) -> list:
-    if bilan.get("erro_parse"):
-        return [{
-            "object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [{"text": {"content": bilan.get("texto_bruto", "")[:2000]}}]}
-        }]
-
-    blocos = []
-    blocos += _bullets("Perguntas Mais Recorrentes", bilan.get("perguntas_recorrentes", []))
-    blocos += _bullets("Dores Não Atendidas", bilan.get("dores_nao_atendidas", []))
-    blocos += _bullets("Pedidos Explícitos de Conteúdo", bilan.get("pedidos_conteudo", []))
-
-    blocos.append({"object": "block", "type": "heading_2",
-                    "heading_2": {"rich_text": [{"text": {"content": "Perfil do Momento"}}]}})
-    blocos.append({"object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": bilan.get("perfil_momento", "")}}]}})
-
-    blocos.append({"object": "block", "type": "heading_2",
-                    "heading_2": {"rich_text": [{"text": {"content": "Diferença Entre Plataformas"}}]}})
-    blocos.append({"object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": bilan.get("diferenca_plataformas", "")}}]}})
-
-    blocos.append({"object": "block", "type": "heading_2",
-                    "heading_2": {"rich_text": [{"text": {"content": "Pautas Sugeridas"}}]}})
-    pautas = bilan.get("pautas_sugeridas", [])
-    if not pautas:
-        blocos.append({"object": "block", "type": "paragraph",
-                        "paragraph": {"rich_text": [{"text": {"content": "— nenhuma pauta sugerida nesta rodada —"}}]}})
-    for p in pautas:
-        linha = f"[{p.get('plataforma', '')}] {p.get('titulo', '')} — {p.get('porque', '')}"
-        blocos.append({"object": "block", "type": "bulleted_list_item",
-                        "bulleted_list_item": {"rich_text": [{"text": {"content": linha}}]}})
-    return blocos
-
+# ── Salvar na base "📊 Análises de Audiência (Semanal)" ──────────────────────
 
 def _erro_e_de_bloco_arquivado(exc: Exception) -> bool:
     return "archived" in str(exc).lower()
 
 
-def salvar_analise_no_notion(bilan: dict):
-    titulo = f"ANÁLISE AUDIÊNCIA — Semana de {SEMANA_LABEL}"
+def _texto_lista(itens: list) -> str:
+    if not itens:
+        return "— nenhum registro nesta rodada —"
+    return "\n".join(f"• {item}" for item in itens)
+
+
+def _texto_pautas(pautas: list) -> str:
+    if not pautas:
+        return "— nenhuma pauta sugerida nesta rodada —"
+    linhas = []
+    for p in pautas:
+        linhas.append(f"[{p.get('plataforma', '')}] {p.get('titulo', '')} — {p.get('porque', '')}")
+    return "\n".join(linhas)
+
+
+def _rt(texto: str) -> dict:
+    """Propriedade rich_text no formato bruto da API Notion (max 2000 chars)."""
+    return {"rich_text": [{"text": {"content": (texto or "")[:2000]}}]}
+
+
+def _title(texto: str) -> dict:
+    return {"title": [{"text": {"content": texto}}]}
+
+
+def _montar_properties(bilan: dict, total_entradas: int, titulo: str) -> dict:
+    erro = bilan.get("erro_parse", False)
+    seg  = {} if erro else bilan.get("segmentos", {}) or {}
+    temas = [] if erro else (bilan.get("temas_audiencia", []) or [])
+
+    properties = {
+        "Semana":                     _title(titulo),
+        "ID Semana":                  _rt(SEMANA_ID),
+        "Data":                       {"date": {"start": AGORA.strftime("%Y-%m-%d")}},
+        "Total Entradas Analisadas":  {"number": total_entradas},
+        "Status":                     {"select": {"name": "Novo"}},
+        "Temas Audiência":            {"multi_select": [{"name": t} for t in temas]},
+    }
+
+    if erro:
+        properties["Perguntas Recorrentes"] = _rt(bilan.get("texto_bruto", ""))
+        properties["Dores Não Atendidas"] = _rt("")
+        properties["Pedidos de Conteúdo"] = _rt("")
+        properties["Perfil do Momento"] = _rt("")
+        properties["Diferença Entre Plataformas"] = _rt("")
+        properties["Pautas Sugeridas"] = _rt("")
+        properties["Segmento Brasil"] = {"number": 0}
+        properties["Segmento Processo"] = {"number": 0}
+        properties["Segmento França"] = {"number": 0}
+    else:
+        properties["Perguntas Recorrentes"]       = _rt(_texto_lista(bilan.get("perguntas_recorrentes", [])))
+        properties["Dores Não Atendidas"]         = _rt(_texto_lista(bilan.get("dores_nao_atendidas", [])))
+        properties["Pedidos de Conteúdo"]         = _rt(_texto_lista(bilan.get("pedidos_conteudo", [])))
+        properties["Perfil do Momento"]           = _rt(bilan.get("perfil_momento", ""))
+        properties["Diferença Entre Plataformas"] = _rt(bilan.get("diferenca_plataformas", ""))
+        properties["Pautas Sugeridas"]            = _rt(_texto_pautas(bilan.get("pautas_sugeridas", [])))
+        properties["Segmento Brasil"]              = {"number": seg.get("brasil", 0) or 0}
+        properties["Segmento Processo"]            = {"number": seg.get("processo", 0) or 0}
+        properties["Segmento França"]              = {"number": seg.get("franca", 0) or 0}
+
+    return properties
+
+
+def _buscar_linha_semana_existente(data_source_id: str):
+    """Procura uma linha já existente para SEMANA_ID, para atualizar em vez de duplicar."""
+    resp = notion.data_sources.query(
+        data_source_id=data_source_id,
+        filter={"property": "ID Semana", "rich_text": {"equals": SEMANA_ID}}
+    )
+    resultados = resp.get("results", [])
+    return resultados[0]["id"] if resultados else None
+
+
+def salvar_analise_na_base(bilan: dict, total_entradas: int):
+    """
+    Salva o bilan como uma LINHA na base "📊 Análises de Audiência (Semanal)".
+    Reprocessar a mesma semana ATUALIZA a linha existente (chave "ID Semana"),
+    em vez de criar uma nova — sem duplicatas mesmo rodando o job mais de uma
+    vez na mesma semana (ex.: reexecução manual após um erro).
+    """
+    titulo = f"Semana de {SEMANA_LABEL}"
+    properties = _montar_properties(bilan, total_entradas, titulo)
+
     try:
-        notion.pages.create(
-            parent={"page_id": NOTION_INTELIGENCIA_PAGE_ID},
-            properties={"title": {"title": [{"text": {"content": titulo}}]}},
-            children=bilan_para_blocos(bilan)
-        )
-        print(f"  ✓ Salvo no Notion: {titulo}")
+        data_source_id = resolver_data_source_id(NOTION_ANALISES_DB_ID)
+        existente = _buscar_linha_semana_existente(data_source_id)
+
+        if existente:
+            notion.pages.update(page_id=existente, properties=properties)
+            print(f"  ✓ Linha atualizada na base de Análises: {titulo}")
+        else:
+            notion.pages.create(
+                parent={"data_source_id": data_source_id},
+                properties=properties
+            )
+            print(f"  ✓ Linha criada na base de Análises: {titulo}")
     except APIResponseError as e:
         if _erro_e_de_bloco_arquivado(e):
-            raise RuntimeError(
-                "A página apontada por NOTION_INTELIGENCIA_PAGE_ID está arquivada "
-                "(na lixeira) no Notion. Abra a página '🧠 Inteligência de Audiência' "
-                "e clique em 'Restore'/'Restaurar' — ou atualize a secret "
-                "NOTION_INTELIGENCIA_PAGE_ID para o ID de uma página válida."
-            ) from e
+            print(
+                "  ⚠ A base NOTION_ANALISES_DB_ID (ou a linha da semana) está arquivada no Notion. "
+                "Abra '📊 Análises de Audiência (Semanal)' e restaure — pulando salvar no Notion "
+                "nesta rodada (insights.json e marcação PROCESSADO seguem normalmente)."
+            )
+            return
         raise
 
 
@@ -285,7 +329,7 @@ def salvar_bilan_no_insights_json(bilan: dict, total_entradas: int):
         return
 
     if bilan.get("erro_parse"):
-        print("  ⚠ Claude não retornou JSON válido — dashboard não atualizado nesta rodada (ver página no Notion).")
+        print("  ⚠ Claude não retornou JSON válido — dashboard não atualizado nesta rodada (ver base no Notion).")
         return
 
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -349,8 +393,8 @@ def main():
     print("Enviando para Claude...")
     bilan = analisar_com_claude(dados_formatados, len(entradas))
 
-    print("Salvando no Notion...")
-    salvar_analise_no_notion(bilan)
+    print("Salvando na base de Análises de Audiência (Notion)...")
+    salvar_analise_na_base(bilan, len(entradas))
 
     print("Atualizando insights.json (dashboard)...")
     salvar_bilan_no_insights_json(bilan, len(entradas))
