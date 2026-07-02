@@ -1,17 +1,29 @@
 """
 MÓDULO 3 — Análise de Audiência
-Roda na segunda segunda-feira do mês via GitHub Actions.
+Roda toda SEXTA-FEIRA às 07:00 (horário de Paris) via GitHub Actions —
+antes do script de busca de fontes, para que a busca de conteúdo já
+leve em conta os insights de audiência mais recentes.
 
 Fluxo:
-1. Busca entradas AUDIÊNCIA + NOVO do Notion (comentários, perguntas, dados)
+1. Busca entradas AUDIÊNCIA + NOVO do Notion (comentários, DMs, stories)
 2. Organiza por plataforma (YouTube / Instagram)
-3. Envia para Claude que gera análise de público-alvo
-4. Salva análise no Notion
-5. Marca entradas como PROCESSADO
+3. Envia para Claude, que devolve um JSON estruturado de análise de audiência
+4. Salva a análise em duas frentes:
+   a) Notion — subpágina legível em "🧠 Inteligência de Audiência"
+   b) insights.json — bloco estruturado em "bilans_audiencia", para o
+      dashboard (index.html) exibir na aba Detalhes → Bilan Qualitativo
+      de Audiência
+5. Marca as entradas usadas como PROCESSADO
+
+Variáveis de ambiente esperadas:
+  NOTION_TOKEN, ANTHROPIC_API_KEY, NOTION_DB_ID, NOTION_INTELIGENCIA_PAGE_ID
+  INSIGHTS_JSON_PATH (opcional — caminho do insights.json no repo, default "insights.json")
 """
 
 import os
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from dotenv import load_dotenv
 from notion_client import Client as NotionClient
 import anthropic
@@ -23,11 +35,14 @@ NOTION_TOKEN                = os.environ["NOTION_TOKEN"]
 ANTHROPIC_API_KEY           = os.environ["ANTHROPIC_API_KEY"]
 NOTION_DB_ID                = os.environ["NOTION_DB_ID"]
 NOTION_INTELIGENCIA_PAGE_ID = os.environ["NOTION_INTELIGENCIA_PAGE_ID"]
+INSIGHTS_JSON_PATH          = os.environ.get("INSIGHTS_JSON_PATH", "insights.json")
 
 notion = NotionClient(auth=NOTION_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-MES_ATUAL = datetime.now(timezone.utc).strftime("%B %Y")
+AGORA        = datetime.now(timezone.utc)
+SEMANA_ID    = AGORA.strftime("%G-W%V")       # ex: 2026-W27 (ISO week, estável mesmo virando o mês)
+SEMANA_LABEL = AGORA.strftime("%d/%m/%Y")
 
 
 # ── Busca de dados ────────────────────────────────────────────────────────────
@@ -67,9 +82,9 @@ def buscar_entradas_audiencia() -> list:
 
 def formatar_entradas(entradas: list) -> str:
     """Organiza entradas por plataforma para o prompt."""
-    youtube  = [e for e in entradas if e["plataforma"] == "YOUTUBE"]
+    youtube   = [e for e in entradas if e["plataforma"] == "YOUTUBE"]
     instagram = [e for e in entradas if e["plataforma"] == "INSTAGRAM"]
-    outro    = [e for e in entradas if e["plataforma"] not in ("YOUTUBE", "INSTAGRAM")]
+    outro     = [e for e in entradas if e["plataforma"] not in ("YOUTUBE", "INSTAGRAM")]
 
     partes = []
 
@@ -96,82 +111,167 @@ def formatar_entradas(entradas: list) -> str:
 
 # ── Análise Claude ────────────────────────────────────────────────────────────
 
-def analisar_com_claude(dados_audiencia: str) -> str:
+SCHEMA_JSON = """{
+  "perguntas_recorrentes": ["string"],
+  "dores_nao_atendidas": ["string"],
+  "pedidos_conteudo": ["string"],
+  "perfil_momento": "string",
+  "diferenca_plataformas": "string",
+  "pautas_sugeridas": [{"plataforma": "YOUTUBE|INSTAGRAM", "titulo": "string", "porque": "string"}],
+  "temas_audiencia": ["string"],
+  "segmentos": {"brasil": 0, "processo": 0, "franca": 0}
+}"""
+
+
+def analisar_com_claude(dados_audiencia: str, total_entradas: int) -> dict:
     prompt = f"""Você é o sistema editorial do canal Por Dentro — canal de uma imigrante brasileira na França que explica como a França realmente funciona: trabalho, saúde, burocracia, moradia, cultura.
 
 Posicionamento: observador, lúcido, educativo. O canal é 75% Instagram hoje e tem crescimento forte nessa plataforma.
 
-Analise os dados de audiência abaixo (comentários, perguntas, observações coletadas ao longo do mês) e gere a ANÁLISE DE AUDIÊNCIA de {MES_ATUAL}.
+Analise os dados de audiência abaixo (comentários, DMs e respostas de stories coletados desde a última rodada) e gere a ANÁLISE DE AUDIÊNCIA da semana de {SEMANA_LABEL}.
 
-## DADOS DA AUDIÊNCIA
+## DADOS DA AUDIÊNCIA ({total_entradas} entradas)
 {dados_audiencia}
 
 ---
 
-Gere o output na estrutura abaixo. Use as palavras exatas da audiência sempre que possível.
+Responda APENAS com um JSON válido (sem markdown, sem cercas de código, sem texto fora do JSON) no formato exato abaixo. Use as palavras exatas da audiência sempre que possível. Se não houver dados suficientes para preencher um campo, use lista vazia ou string vazia — nunca invente.
 
-## PERGUNTAS MAIS RECORRENTES
-As dúvidas que aparecem mais vezes — essas viram pauta prioritária.
+{SCHEMA_JSON}
 
-## DORES NÃO ATENDIDAS
-O que a audiência precisa que o canal ainda não respondeu bem ou não cobriu.
-
-## PEDIDOS EXPLÍCITOS DE CONTEÚDO
-Quando alguém pediu diretamente um tema, formato ou continuação.
-
-## PERFIL DO MOMENTO
-Quem está engajando agora: recém-chegado na França, planejando imigrar, já estabelecido? Que fase da vida?
-
-## DIFERENÇA ENTRE PLATAFORMAS
-O que a audiência do YouTube quer vs. o que a audiência do Instagram quer. Se houver diferença relevante.
-
-## PAUTAS SUGERIDAS
-3 ideias concretas de conteúdo com ângulo específico que saem diretamente desses dados.
-Formato: [PLATAFORMA] Título sugerido — por que esse ângulo funciona."""
+Onde:
+- perguntas_recorrentes: dúvidas que aparecem mais de uma vez — essas viram pauta prioritária
+- dores_nao_atendidas: o que a audiência precisa que o canal ainda não respondeu bem ou não cobriu
+- pedidos_conteudo: quando alguém pediu diretamente um tema, formato ou continuação
+- perfil_momento: quem está engajando agora (recém-chegado, planejando imigrar, já estabelecido) e em que fase de vida
+- diferenca_plataformas: o que a audiência do YouTube quer vs. o que a audiência do Instagram quer, se houver diferença relevante
+- pautas_sugeridas: 3 ideias concretas de conteúdo com ângulo específico que saem diretamente desses dados
+- temas_audiencia: até 6 palavras/temas-chave recorrentes nos dados (vira tag no dashboard)
+- segmentos: contagem aproximada de quantas entradas vêm de cada estágio — brasil (ainda no Brasil, pesquisando), processo (em processo de imigração/burocracia), franca (já vivendo na França)"""
 
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=2000,
+        max_tokens=2500,
         messages=[{"role": "user", "content": prompt}]
     )
-    return resp.content[0].text
+    texto = resp.content[0].text.strip()
+
+    # Blindagem: se o modelo insistir em cercar o JSON com ```, remove.
+    if texto.startswith("```"):
+        texto = texto.strip("`")
+        if texto.lower().startswith("json"):
+            texto = texto[4:]
+        texto = texto.strip()
+
+    try:
+        return json.loads(texto)
+    except json.JSONDecodeError:
+        # Fallback: não perde a análise, só marca que não veio estruturada.
+        return {"erro_parse": True, "texto_bruto": texto}
 
 
-# ── Salvar no Notion ──────────────────────────────────────────────────────────
+# ── Salvar no Notion (subpágina legível) ─────────────────────────────────────
 
-def texto_para_blocos(texto: str) -> list:
-    """Converte texto com ## headings em blocos Notion."""
-    blocos = []
-    for linha in texto.split("\n"):
-        linha = linha.strip()
-        if not linha:
-            continue
-        if linha.startswith("## "):
-            blocos.append({
-                "object": "block", "type": "heading_2",
-                "heading_2": {"rich_text": [{"text": {"content": linha[3:]}}]}
-            })
-        elif linha.startswith("### "):
-            blocos.append({
-                "object": "block", "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": linha[4:]}}]}
-            })
-        else:
-            blocos.append({
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"text": {"content": linha}}]}
-            })
+def _bullets(titulo: str, itens: list) -> list:
+    blocos = [{
+        "object": "block", "type": "heading_2",
+        "heading_2": {"rich_text": [{"text": {"content": titulo}}]}
+    }]
+    if not itens:
+        blocos.append({
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"text": {"content": "— nenhum registro nesta rodada —"}}]}
+        })
+        return blocos
+    for item in itens:
+        blocos.append({
+            "object": "block", "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"text": {"content": str(item)}}]}
+        })
     return blocos
 
 
-def salvar_analise_no_notion(analise: str):
-    titulo = f"ANÁLISE AUDIÊNCIA — {MES_ATUAL}"
+def bilan_para_blocos(bilan: dict) -> list:
+    if bilan.get("erro_parse"):
+        return [{
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"text": {"content": bilan.get("texto_bruto", "")[:2000]}}]}
+        }]
+
+    blocos = []
+    blocos += _bullets("Perguntas Mais Recorrentes", bilan.get("perguntas_recorrentes", []))
+    blocos += _bullets("Dores Não Atendidas", bilan.get("dores_nao_atendidas", []))
+    blocos += _bullets("Pedidos Explícitos de Conteúdo", bilan.get("pedidos_conteudo", []))
+
+    blocos.append({"object": "block", "type": "heading_2",
+                    "heading_2": {"rich_text": [{"text": {"content": "Perfil do Momento"}}]}})
+    blocos.append({"object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": [{"text": {"content": bilan.get("perfil_momento", "")}}]}})
+
+    blocos.append({"object": "block", "type": "heading_2",
+                    "heading_2": {"rich_text": [{"text": {"content": "Diferença Entre Plataformas"}}]}})
+    blocos.append({"object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": [{"text": {"content": bilan.get("diferenca_plataformas", "")}}]}})
+
+    blocos.append({"object": "block", "type": "heading_2",
+                    "heading_2": {"rich_text": [{"text": {"content": "Pautas Sugeridas"}}]}})
+    pautas = bilan.get("pautas_sugeridas", [])
+    if not pautas:
+        blocos.append({"object": "block", "type": "paragraph",
+                        "paragraph": {"rich_text": [{"text": {"content": "— nenhuma pauta sugerida nesta rodada —"}}]}})
+    for p in pautas:
+        linha = f"[{p.get('plataforma', '')}] {p.get('titulo', '')} — {p.get('porque', '')}"
+        blocos.append({"object": "block", "type": "bulleted_list_item",
+                        "bulleted_list_item": {"rich_text": [{"text": {"content": linha}}]}})
+    return blocos
+
+
+def salvar_analise_no_notion(bilan: dict):
+    titulo = f"ANÁLISE AUDIÊNCIA — Semana de {SEMANA_LABEL}"
     notion.pages.create(
         parent={"page_id": NOTION_INTELIGENCIA_PAGE_ID},
         properties={"title": {"title": [{"text": {"content": titulo}}]}},
-        children=texto_para_blocos(analise)
+        children=bilan_para_blocos(bilan)
     )
-    print(f"  ✓ Salvo: {titulo}")
+    print(f"  ✓ Salvo no Notion: {titulo}")
+
+
+# ── Salvar no insights.json (alimenta o dashboard) ───────────────────────────
+
+def salvar_bilan_no_insights_json(bilan: dict, total_entradas: int):
+    path = Path(INSIGHTS_JSON_PATH)
+    if not path.exists():
+        print(f"  ⚠ {INSIGHTS_JSON_PATH} não encontrado — pulando atualização do dashboard.")
+        return
+
+    if bilan.get("erro_parse"):
+        print("  ⚠ Claude não retornou JSON válido — dashboard não atualizado nesta rodada (ver página no Notion).")
+        return
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("bilans_audiencia", [])
+
+    entrada = {
+        "id": SEMANA_ID,
+        "data": AGORA.strftime("%Y-%m-%d"),
+        "periodo_label": f"Semana de {SEMANA_LABEL}",
+        "total_entradas_analisadas": total_entradas,
+        "perguntas_recorrentes": bilan.get("perguntas_recorrentes", []),
+        "dores_nao_atendidas": bilan.get("dores_nao_atendidas", []),
+        "pedidos_conteudo": bilan.get("pedidos_conteudo", []),
+        "perfil_momento": bilan.get("perfil_momento", ""),
+        "diferenca_plataformas": bilan.get("diferenca_plataformas", ""),
+        "pautas_sugeridas": bilan.get("pautas_sugeridas", []),
+        "temas_audiencia": bilan.get("temas_audiencia", []),
+        "segmentos": bilan.get("segmentos", {}),
+    }
+
+    # Reprocessar a mesma semana substitui a entrada anterior em vez de duplicar.
+    data["bilans_audiencia"] = [b for b in data["bilans_audiencia"] if b.get("id") != SEMANA_ID]
+    data["bilans_audiencia"].append(entrada)
+
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"  ✓ Atualizado {INSIGHTS_JSON_PATH} (bilans_audiencia: {len(data['bilans_audiencia'])} rodada(s))")
 
 
 def marcar_processado(page_id: str):
@@ -184,7 +284,7 @@ def marcar_processado(page_id: str):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"\n=== Análise de Audiência — {MES_ATUAL} ===\n")
+    print(f"\n=== Análise de Audiência — Semana de {SEMANA_LABEL} ===\n")
 
     print("Buscando entradas de audiência...")
     entradas = buscar_entradas_audiencia()
@@ -198,10 +298,13 @@ def main():
     dados_formatados = formatar_entradas(entradas)
 
     print("Enviando para Claude...")
-    analise = analisar_com_claude(dados_formatados)
+    bilan = analisar_com_claude(dados_formatados, len(entradas))
 
     print("Salvando no Notion...")
-    salvar_analise_no_notion(analise)
+    salvar_analise_no_notion(bilan)
+
+    print("Atualizando insights.json (dashboard)...")
+    salvar_bilan_no_insights_json(bilan, len(entradas))
 
     print("Marcando entradas como processadas...")
     for e in entradas:
