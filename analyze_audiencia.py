@@ -16,8 +16,11 @@ Fluxo:
 5. Marca as entradas usadas como PROCESSADO
 
 Variáveis de ambiente esperadas:
-  NOTION_TOKEN, ANTHROPIC_API_KEY, NOTION_DB_ID, NOTION_INTELIGENCIA_PAGE_ID
+  NOTION_TOKEN, ANTHROPIC_API_KEY, NOTION_DB_IG, NOTION_INTELIGENCIA_PAGE_ID
   INSIGHTS_JSON_PATH (opcional — caminho do insights.json no repo, default "insights.json")
+
+  Nota: o database do Instagram é lido da secret NOTION_DB_IG (não NOTION_DB_ID,
+  que já estava em uso por outro módulo/database no mesmo repositório).
 """
 
 import os
@@ -33,7 +36,7 @@ load_dotenv()
 # ── Configuração ──────────────────────────────────────────────────────────────
 NOTION_TOKEN                = os.environ["NOTION_TOKEN"]
 ANTHROPIC_API_KEY           = os.environ["ANTHROPIC_API_KEY"]
-NOTION_DB_ID                = os.environ["NOTION_DB_ID"]
+NOTION_DB_ID                = os.environ["NOTION_DB_IG"]
 NOTION_INTELIGENCIA_PAGE_ID = os.environ["NOTION_INTELIGENCIA_PAGE_ID"]
 INSIGHTS_JSON_PATH          = os.environ.get("INSIGHTS_JSON_PATH", "insights.json")
 
