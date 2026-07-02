@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from notion_client import Client as NotionClient
+from notion_client.errors import APIResponseError
 import anthropic
 
 load_dotenv()
@@ -251,14 +252,28 @@ def bilan_para_blocos(bilan: dict) -> list:
     return blocos
 
 
+def _erro_e_de_bloco_arquivado(exc: Exception) -> bool:
+    return "archived" in str(exc).lower()
+
+
 def salvar_analise_no_notion(bilan: dict):
     titulo = f"ANÁLISE AUDIÊNCIA — Semana de {SEMANA_LABEL}"
-    notion.pages.create(
-        parent={"page_id": NOTION_INTELIGENCIA_PAGE_ID},
-        properties={"title": {"title": [{"text": {"content": titulo}}]}},
-        children=bilan_para_blocos(bilan)
-    )
-    print(f"  ✓ Salvo no Notion: {titulo}")
+    try:
+        notion.pages.create(
+            parent={"page_id": NOTION_INTELIGENCIA_PAGE_ID},
+            properties={"title": {"title": [{"text": {"content": titulo}}]}},
+            children=bilan_para_blocos(bilan)
+        )
+        print(f"  ✓ Salvo no Notion: {titulo}")
+    except APIResponseError as e:
+        if _erro_e_de_bloco_arquivado(e):
+            raise RuntimeError(
+                "A página apontada por NOTION_INTELIGENCIA_PAGE_ID está arquivada "
+                "(na lixeira) no Notion. Abra a página '🧠 Inteligência de Audiência' "
+                "e clique em 'Restore'/'Restaurar' — ou atualize a secret "
+                "NOTION_INTELIGENCIA_PAGE_ID para o ID de uma página válida."
+            ) from e
+        raise
 
 
 # ── Salvar no insights.json (alimenta o dashboard) ───────────────────────────
@@ -300,10 +315,19 @@ def salvar_bilan_no_insights_json(bilan: dict, total_entradas: int):
 
 
 def marcar_processado(page_id: str):
-    notion.pages.update(
-        page_id=page_id,
-        properties={"STATUS": {"select": {"name": "PROCESSADO"}}}
-    )
+    try:
+        notion.pages.update(
+            page_id=page_id,
+            properties={"STATUS": {"select": {"name": "PROCESSADO"}}}
+        )
+    except APIResponseError as e:
+        if _erro_e_de_bloco_arquivado(e):
+            # Acontece quando a entrada foi movida pra lixeira no Notion entre a
+            # busca e esta etapa (ex.: teste manual arquivado). Não deve derrubar
+            # o job inteiro — a análise e o insights.json já foram salvos antes.
+            print(f"  ⚠ Página {page_id} está arquivada (lixeira) no Notion — pulando, não foi possível marcar PROCESSADO.")
+        else:
+            raise
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
