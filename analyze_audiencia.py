@@ -324,16 +324,24 @@ def salvar_analise_na_base(bilan: dict, total_entradas: int):
 
 def salvar_bilan_no_insights_json(bilan: dict, total_entradas: int):
     path = Path(INSIGHTS_JSON_PATH)
+
     if not path.exists():
-        print(f"  ⚠ {INSIGHTS_JSON_PATH} não encontrado — pulando atualização do dashboard.")
-        return
+        # Bootstrap defensivo: se o arquivo nunca foi commitado no repositório
+        # (checkout "limpo"), criamos um esqueleto mínimo em vez de só pular —
+        # assim o passo de commit do workflow sempre tem algo válido para
+        # versionar. Isso NÃO substitui o insights.json "de verdade" (com
+        # metas/semanas/ciclos do dashboard) — se esse arquivo existe só na
+        # sua máquina, comite-o uma vez na raiz do repositório para que o
+        # dashboard mostre o histórico completo, não só os bilans de audiência.
+        print(f"  ⚠ {INSIGHTS_JSON_PATH} não existe no repositório — criando esqueleto mínimo.")
+        data = {"bilans_audiencia": []}
+    else:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.setdefault("bilans_audiencia", [])
 
     if bilan.get("erro_parse"):
         print("  ⚠ Claude não retornou JSON válido — dashboard não atualizado nesta rodada (ver base no Notion).")
         return
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data.setdefault("bilans_audiencia", [])
 
     entrada = {
         "id": SEMANA_ID,
