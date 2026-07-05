@@ -1,68 +1,130 @@
 """
 MÓDULO 3 — Análise de Concorrência
-Roda na primeira segunda-feira do mês via GitHub Actions.
+Roda na primeira segunda-feira do mês via GitHub Actions (guard semanal — ver
+Analise_concorrencia.yml, que dispara toda segunda e pula quando não é a primeira).
 
 Fluxo:
-1. Busca páginas de COLETA YT salvas no mês atual (pasta Inteligência)
-2. Busca entradas CONCORRÊNCIA + INSTAGRAM + NOVO (observações manuais)
-3. Envia tudo para Claude que gera o BENCHMARK do mês
-4. Salva análise como nova página no Notion
-5. Marca entradas Instagram como PROCESSADO
+1. Busca linhas da base COLETAS YOUTUBE (CATEGORIA=CONCORRÊNCIA) do mês atual
+2. Busca observações de concorrência no Instagram, de DUAS fontes:
+   a) FICHIERS INSTAGRAM — notas manuais em texto (CATEGORIA=CONCORRÊNCIA + PLATAFORMA=
+      INSTAGRAM + STATUS=NOVO)
+   b) Inputs Benchmark Instagram — prints de posts/reels de concorrentes já transcritos
+      pela Claude em enriquecer_conversas_audiencia.py (CATEGORIA=CONCORRÊNCIA +
+      PLATAFORMA=INSTAGRAM + STATUS=Analisado)
+3. Envia tudo para Claude, que gera o BENCHMARK do mês em seções fixas (##)
+4. Salva/atualiza UMA LINHA na base "🎯 Benchmarks de Concorrência (Mensal)"
+   (chave "ID Mês" — reprocessar o mesmo mês atualiza a linha em vez de duplicar)
+5. Marca as entradas usadas (das duas fontes de Instagram) como PROCESSADO
+
+Variáveis de ambiente esperadas:
+  NOTION_TOKEN, ANTHROPIC_API_KEY, NOTION_DB_ID, NOTION_DB_IG, NOTION_COLETAS_DB_ID,
+  NOTION_BENCHMARKS_DB_ID
+
+Nota de correção (05/07/2026): antes desta versão, este script tentava ler "páginas COLETA YT"
+filhas de uma página Notion (NOTION_INTELIGENCIA_PAGE_ID) que estava deletada/em branco — nunca
+encontrava dados reais, porque o collect.py sempre gravou os canais como LINHAS na base COLETAS
+YOUTUBE, não como páginas-filhas. O resultado também era salvo como página solta em vez de linha
+estruturada, e o cron do workflow (`0 9 1-7 * 1`) disparava o job em todo dia 1–7 do mês MAIS toda
+segunda-feira — sem proteção contra duplicar. As três coisas foram corrigidas: leitura direta de
+COLETAS YOUTUBE, upsert por "ID Mês" na nova base estruturada, e cron consertado no workflow.
+
+Nota de atualização (05/07/2026): "🗨️ CONVERSAS AUDIÊNCIA (Instagram)" virou "Inputs Benchmark
+Instagram" e passou a aceitar CATEGORIA=CONCORRÊNCIA (prints de concorrentes), além de AUDIÊNCIA.
+Este script foi atualizado para também consultar essa base (NOTION_DB_IG) como segunda fonte de
+observações de Instagram, somando-se às notas manuais de FICHIERS INSTAGRAM.
 """
 
 import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from notion_client import Client as NotionClient
+from notion_client.errors import APIResponseError
 import anthropic
 
 load_dotenv()
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-NOTION_TOKEN                = os.environ["NOTION_TOKEN"]
-ANTHROPIC_API_KEY           = os.environ["ANTHROPIC_API_KEY"]
-NOTION_DB_ID                = os.environ["NOTION_DB_ID"]
-NOTION_INTELIGENCIA_PAGE_ID = os.environ["NOTION_INTELIGENCIA_PAGE_ID"]
+NOTION_TOKEN            = os.environ["NOTION_TOKEN"]
+ANTHROPIC_API_KEY       = os.environ["ANTHROPIC_API_KEY"]
+NOTION_DB_ID            = os.environ["NOTION_DB_ID"]              # FICHIERS INSTAGRAM
+NOTION_DB_IG            = os.environ["NOTION_DB_IG"]              # Inputs Benchmark Instagram
+NOTION_COLETAS_DB_ID    = os.environ["NOTION_COLETAS_DB_ID"]      # COLETAS YOUTUBE
+NOTION_BENCHMARKS_DB_ID = os.environ["NOTION_BENCHMARKS_DB_ID"]   # 🎯 Benchmarks de Concorrência (Mensal)
 
 notion = NotionClient(auth=NOTION_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-MES_ATUAL = datetime.now(timezone.utc).strftime("%B %Y")
+MESES_PT = {
+    "January": "Janeiro", "February": "Fevereiro", "March": "Março",
+    "April": "Abril", "May": "Maio", "June": "Junho",
+    "July": "Julho", "August": "Agosto", "September": "Setembro",
+    "October": "Outubro", "November": "Novembro", "December": "Dezembro"
+}
+
+AGORA        = datetime.now(timezone.utc)
+MES_ATUAL_PT = MESES_PT[AGORA.strftime("%B")]              # ex: "Julho" — bate com o select "Mês" de COLETAS YOUTUBE
+MES_ID       = AGORA.strftime("%Y-%m")                     # ex: "2026-07" — chave estável para upsert
+MES_LABEL    = f"{MES_ATUAL_PT} {AGORA.strftime('%Y')}"    # ex: "Julho 2026" — título da linha
+
+_data_source_cache = {}
+
+
+def resolver_data_source_id(database_id: str) -> str:
+    """Resolve o data_source_id atual de um database (API Notion 2025-09-03+). Ver analyze_audiencia.py."""
+    if database_id in _data_source_cache:
+        return _data_source_cache[database_id]
+    db = notion.databases.retrieve(database_id=database_id)
+    data_sources = db.get("data_sources", [])
+    if not data_sources:
+        raise RuntimeError(f"O database {database_id} não retornou nenhum data_source.")
+    data_source_id = data_sources[0]["id"]
+    _data_source_cache[database_id] = data_source_id
+    return data_source_id
 
 
 # ── Busca de dados ────────────────────────────────────────────────────────────
 
-def buscar_coletas_youtube() -> str:
-    """Lê as páginas COLETA YT do mês atual na pasta Inteligência."""
-    resp = notion.blocks.children.list(block_id=NOTION_INTELIGENCIA_PAGE_ID)
-    coletas = []
+def buscar_coletas_youtube() -> tuple[list, str]:
+    """Lê as linhas da base COLETAS YOUTUBE (CATEGORIA=CONCORRÊNCIA) do mês atual."""
+    data_source_id = resolver_data_source_id(NOTION_COLETAS_DB_ID)
+    resp = notion.data_sources.query(
+        data_source_id=data_source_id,
+        filter={
+            "and": [
+                {"property": "CATEGORIA", "select": {"equals": "CONCORRÊNCIA"}},
+                {"property": "Mês",       "select": {"equals": MES_ATUAL_PT}},
+            ]
+        }
+    )
+    linhas = resp.get("results", [])
+    textos = []
+    for page in linhas:
+        props = page["properties"]
+        canal_prop = props.get("Canal", {}).get("title", [])
+        nome = canal_prop[0]["text"]["content"] if canal_prop else "canal sem nome"
 
-    for bloco in resp.get("results", []):
-        if bloco.get("type") != "child_page":
-            continue
-        titulo = bloco.get("child_page", {}).get("title", "")
-        if "COLETA YT" not in titulo or MES_ATUAL not in titulo:
-            continue
+        inscritos     = props.get("Inscritos", {}).get("number")
+        total_videos  = props.get("Total Vídeos", {}).get("number")
+        top_video_txt = "".join(
+            rt.get("text", {}).get("content", "")
+            for rt in props.get("Top Vídeo", {}).get("rich_text", [])
+        )
+        top_video_views = props.get("Top Vídeo Views", {}).get("number")
 
-        # Lê conteúdo da página de coleta
-        conteudo_resp = notion.blocks.children.list(block_id=bloco["id"])
-        texto = []
-        for b in conteudo_resp.get("results", []):
-            tipo = b.get("type", "")
-            rich = b.get(tipo, {}).get("rich_text", [])
-            linha = "".join(rt.get("text", {}).get("content", "") for rt in rich)
-            if linha:
-                texto.append(linha)
+        linha = f"**{nome}** — {inscritos if inscritos is not None else '?'} inscritos, {total_videos if total_videos is not None else '?'} vídeos totais"
+        if top_video_txt:
+            linha += f"\n  Top vídeo do mês: \"{top_video_txt}\" ({top_video_views if top_video_views is not None else '?'} views)"
+        textos.append(linha)
 
-        coletas.append(f"### {titulo}\n" + "\n".join(texto))
-
-    return "\n\n---\n\n".join(coletas) if coletas else "Nenhuma coleta YouTube disponível este mês."
+    conteudo = "\n\n".join(textos) if textos else "Nenhuma coleta YouTube disponível este mês."
+    return linhas, conteudo
 
 
 def buscar_observacoes_instagram() -> tuple[list, str]:
-    """Busca entradas manuais de concorrência no Instagram."""
-    resp = notion.databases.query(
-        database_id=NOTION_DB_ID,
+    """Notas manuais em texto sobre concorrência no Instagram, em FICHIERS INSTAGRAM."""
+    data_source_id = resolver_data_source_id(NOTION_DB_ID)
+    resp = notion.data_sources.query(
+        data_source_id=data_source_id,
         filter={
             "and": [
                 {"property": "CATEGORIA",  "select": {"equals": "CONCORRÊNCIA"}},
@@ -84,28 +146,91 @@ def buscar_observacoes_instagram() -> tuple[list, str]:
 
         textos.append(f"**{nome}**\n{texto}")
 
-    conteudo = "\n\n---\n\n".join(textos) if textos else "Nenhuma observação Instagram depositada."
+    conteudo = "\n\n---\n\n".join(textos) if textos else "Nenhuma observação manual depositada."
+    return entradas, conteudo
+
+
+def _texto_rt(props: dict, campo: str) -> str:
+    return "".join(rt.get("text", {}).get("content", "") for rt in props.get(campo, {}).get("rich_text", []))
+
+
+def buscar_prints_concorrencia_instagram() -> tuple[list, str]:
+    """Prints de concorrentes já transcritos pela Claude, em Inputs Benchmark Instagram."""
+    data_source_id = resolver_data_source_id(NOTION_DB_IG)
+    resp = notion.data_sources.query(
+        data_source_id=data_source_id,
+        filter={
+            "and": [
+                {"property": "CATEGORIA",  "select": {"equals": "CONCORRÊNCIA"}},
+                {"property": "PLATAFORMA", "select": {"equals": "INSTAGRAM"}},
+                {"property": "STATUS",     "select": {"equals": "Analisado"}}
+            ]
+        }
+    )
+
+    entradas = resp.get("results", [])
+    textos = []
+
+    for e in entradas:
+        props = e["properties"]
+        nome_prop = props.get("Name", {}).get("title", [])
+        nome = nome_prop[0]["text"]["content"] if nome_prop else "sem título"
+
+        perfil = _texto_rt(props, "Perfil Concorrente")
+        formato = (props.get("Formato do Post", {}).get("select") or {}).get("name", "")
+        tema = _texto_rt(props, "Tema do Concorrente")
+        gancho = _texto_rt(props, "Gancho")
+        adaptar = _texto_rt(props, "O Que Dá Pra Adaptar")
+        texte = _texto_rt(props, "Texte")
+
+        linha = f"**{nome}**"
+        if perfil:
+            linha += f" ({perfil})"
+        if formato:
+            linha += f" — formato: {formato}"
+        if tema:
+            linha += f"\n  Tema: {tema}"
+        if gancho:
+            linha += f"\n  Gancho: {gancho}"
+        if texte:
+            linha += f"\n  Resumo: {texte}"
+        if adaptar:
+            linha += f"\n  O que dá pra adaptar: {adaptar}"
+        textos.append(linha)
+
+    conteudo = "\n\n---\n\n".join(textos) if textos else "Nenhum print de concorrente analisado ainda."
     return entradas, conteudo
 
 
 # ── Análise Claude ────────────────────────────────────────────────────────────
+
+# Mapeia o título de cada seção "## " do output da Claude para a propriedade
+# correspondente na base "🎯 Benchmarks de Concorrência (Mensal)".
+SECOES = [
+    ("O QUE ESTÁ FUNCIONANDO NO NICHO",      "O Que Está Funcionando"),
+    ("SINAIS DE ALGORITMO DO PERÍODO",       "Sinais de Algoritmo"),
+    ("LACUNAS QUE O POR DENTRO PODE OCUPAR", "Lacunas"),
+    ("O QUE NÃO FAZER",                      "O Que Não Fazer"),
+    ("RECOMENDAÇÃO EDITORIAL DO MÊS",        "Recomendação Editorial"),
+]
+
 
 def analisar_com_claude(youtube_data: str, instagram_data: str) -> str:
     prompt = f"""Você é o sistema editorial do canal Por Dentro — canal de uma imigrante brasileira na França que explica como a França realmente funciona: trabalho, saúde, burocracia, moradia, cultura.
 
 Posicionamento: observador, lúcido, educativo. Nunca romantiza nem catastrofiza. Nunca clickbait no corpo do conteúdo.
 
-Analise os dados de concorrência abaixo e gere o BENCHMARK CONCORRÊNCIA de {MES_ATUAL}.
+Analise os dados de concorrência abaixo e gere o BENCHMARK CONCORRÊNCIA de {MES_LABEL}.
 
 ## DADOS YOUTUBE (coletados automaticamente das últimas semanas)
 {youtube_data}
 
-## OBSERVAÇÕES INSTAGRAM (depositadas manualmente)
+## DADOS INSTAGRAM (notas manuais + prints de concorrentes analisados)
 {instagram_data}
 
 ---
 
-Gere o output na estrutura abaixo. Seja específico, use dados concretos, posicione tudo para o Por Dentro.
+Gere o output na estrutura abaixo, usando EXATAMENTE esses títulos de seção (com "## "), nesta ordem — eles são usados para preencher colunas de uma base estruturada, então não mude o texto dos títulos. Seja específico, use dados concretos, posicione tudo para o Por Dentro.
 
 ## O QUE ESTÁ FUNCIONANDO NO NICHO
 3 tendências com exemplos concretos dos dados acima.
@@ -130,69 +255,138 @@ Uma decisão clara e acionável para o próximo calendário editorial."""
     return resp.content[0].text
 
 
-# ── Salvar no Notion ──────────────────────────────────────────────────────────
-
-def texto_para_blocos(texto: str) -> list:
-    """Converte texto com ## headings em blocos Notion."""
-    blocos = []
+def parsear_secoes(texto: str) -> dict:
+    """Quebra a resposta da Claude em {título_da_seção: conteúdo}, usando os headings '## '."""
+    blocos = {}
+    atual = None
+    linhas_atual = []
     for linha in texto.split("\n"):
-        linha = linha.strip()
-        if not linha:
-            continue
-        if linha.startswith("## "):
-            blocos.append({
-                "object": "block", "type": "heading_2",
-                "heading_2": {"rich_text": [{"text": {"content": linha[3:]}}]}
-            })
-        elif linha.startswith("### "):
-            blocos.append({
-                "object": "block", "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": linha[4:]}}]}
-            })
+        if linha.strip().startswith("## "):
+            if atual is not None:
+                blocos[atual] = "\n".join(linhas_atual).strip()
+            atual = linha.strip()[3:].strip()
+            linhas_atual = []
         else:
-            blocos.append({
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"text": {"content": linha}}]}
-            })
+            linhas_atual.append(linha)
+    if atual is not None:
+        blocos[atual] = "\n".join(linhas_atual).strip()
     return blocos
 
 
-def salvar_analise_no_notion(analise: str):
-    titulo = f"BENCHMARK CONCORRÊNCIA — {MES_ATUAL}"
-    notion.pages.create(
-        parent={"page_id": NOTION_INTELIGENCIA_PAGE_ID},
-        properties={"title": {"title": [{"text": {"content": titulo}}]}},
-        children=texto_para_blocos(analise)
+# ── Salvar em "🎯 Benchmarks de Concorrência (Mensal)" ───────────────────────
+
+def _rt(texto: str) -> dict:
+    return {"rich_text": [{"text": {"content": (texto or "")[:2000]}}]}
+
+
+def _title(texto: str) -> dict:
+    return {"title": [{"text": {"content": texto}}]}
+
+
+def _montar_properties(secoes: dict, total_youtube: int, total_instagram: int) -> dict:
+    properties = {
+        "Mês":                              _title(MES_LABEL),
+        "ID Mês":                           _rt(MES_ID),
+        "Data da Rodada":                   {"date": {"start": AGORA.strftime("%Y-%m-%d")}},
+        "Status":                           {"select": {"name": "Novo"}},
+        "Total Canais YouTube Analisados":  {"number": total_youtube},
+        "Total Observações Instagram":      {"number": total_instagram},
+    }
+    for titulo_prompt, propriedade in SECOES:
+        properties[propriedade] = _rt(secoes.get(titulo_prompt, ""))
+    return properties
+
+
+def _buscar_linha_mes_existente(data_source_id: str):
+    """Procura uma linha já existente para MES_ID, para atualizar em vez de duplicar."""
+    resp = notion.data_sources.query(
+        data_source_id=data_source_id,
+        filter={"property": "ID Mês", "rich_text": {"equals": MES_ID}}
     )
-    print(f"  ✓ Salvo: {titulo}")
+    resultados = resp.get("results", [])
+    return resultados[0]["id"] if resultados else None
+
+
+def salvar_analise_na_base(secoes: dict, total_youtube: int, total_instagram: int):
+    """
+    Salva o benchmark como uma LINHA em "🎯 Benchmarks de Concorrência (Mensal)".
+    Reprocessar o mesmo mês ATUALIZA a linha existente (chave "ID Mês"), em vez de
+    criar uma nova — protege contra duplicatas mesmo se o cron disparar mais de uma
+    vez no mesmo mês (ex.: reexecução manual, ou falha de agendamento).
+    """
+    properties = _montar_properties(secoes, total_youtube, total_instagram)
+
+    try:
+        data_source_id = resolver_data_source_id(NOTION_BENCHMARKS_DB_ID)
+        existente = _buscar_linha_mes_existente(data_source_id)
+
+        if existente:
+            notion.pages.update(page_id=existente, properties=properties)
+            print(f"  ✓ Linha atualizada em Benchmarks de Concorrência: {MES_LABEL}")
+        else:
+            notion.pages.create(parent={"data_source_id": data_source_id}, properties=properties)
+            print(f"  ✓ Linha criada em Benchmarks de Concorrência: {MES_LABEL}")
+    except APIResponseError as e:
+        if "archived" in str(e).lower():
+            print(
+                "  ⚠ A base NOTION_BENCHMARKS_DB_ID (ou a linha do mês) está arquivada no Notion. "
+                "Abra '🎯 Benchmarks de Concorrência (Mensal)' e restaure — pulando salvar nesta rodada."
+            )
+            return
+        raise
 
 
 def marcar_processado(page_id: str):
-    notion.pages.update(
-        page_id=page_id,
-        properties={"STATUS": {"select": {"name": "PROCESSADO"}}}
-    )
+    try:
+        notion.pages.update(
+            page_id=page_id,
+            properties={"STATUS": {"select": {"name": "PROCESSADO"}}}
+        )
+    except APIResponseError as e:
+        if "archived" in str(e).lower():
+            print(f"  ⚠ Página {page_id} está arquivada (lixeira) no Notion — pulando.")
+        else:
+            raise
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"\n=== Análise de Concorrência — {MES_ATUAL} ===\n")
+    print(f"\n=== Análise de Concorrência — {MES_LABEL} ===\n")
 
-    print("Buscando coletas YouTube do mês...")
-    youtube_data = buscar_coletas_youtube()
+    print("Buscando coletas YouTube do mês (base COLETAS YOUTUBE)...")
+    linhas_youtube, youtube_data = buscar_coletas_youtube()
+    print(f"  {len(linhas_youtube)} canal(is) encontrado(s).")
 
-    print("Buscando observações Instagram...")
-    entradas_ig, instagram_data = buscar_observacoes_instagram()
+    print("Buscando observações manuais de Instagram (base FICHIERS INSTAGRAM)...")
+    entradas_ig, instagram_texto = buscar_observacoes_instagram()
+    print(f"  {len(entradas_ig)} observação(ões) manual(is) encontrada(s).")
+
+    print("Buscando prints de concorrentes analisados (base Inputs Benchmark Instagram)...")
+    entradas_prints, prints_texto = buscar_prints_concorrencia_instagram()
+    print(f"  {len(entradas_prints)} print(s) encontrado(s).")
+
+    total_instagram = len(entradas_ig) + len(entradas_prints)
+    instagram_data = (
+        f"### Notas manuais (FICHIERS INSTAGRAM)\n{instagram_texto}\n\n"
+        f"### Prints de concorrentes analisados (Inputs Benchmark Instagram)\n{prints_texto}"
+    )
+
+    if not linhas_youtube and total_instagram == 0:
+        print("Nenhum dado de concorrência disponível este mês — pulando geração de benchmark.")
+        return
 
     print("Enviando para Claude...")
     analise = analisar_com_claude(youtube_data, instagram_data)
+    secoes = parsear_secoes(analise)
 
-    print("Salvando no Notion...")
-    salvar_analise_no_notion(analise)
+    print("Salvando em 🎯 Benchmarks de Concorrência (Mensal)...")
+    salvar_analise_na_base(secoes, len(linhas_youtube), total_instagram)
 
-    print("Marcando entradas como processadas...")
+    print("Marcando entradas usadas como processadas...")
     for e in entradas_ig:
+        marcar_processado(e["id"])
+    for e in entradas_prints:
         marcar_processado(e["id"])
 
     print("\n=== Análise de concorrência concluída ===")
